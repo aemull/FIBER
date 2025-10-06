@@ -1,0 +1,4 @@
+.venv-linux
+database/*
+output
+.gitignire
