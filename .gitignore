@@ -2,3 +2,5 @@
 database/*
 output
 .gitignire
+__pycache__
+percobaan

@@ -1,438 +1,191 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
-import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
-import numpy as np
-import time
+import yfinance as yf
+from datetime import datetime
+from io import BytesIO
 
-# Set page configuration
-st.set_page_config(
-    page_title="Stock Analysis Dashboard",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+# =========================================================
+# 1. Fungsi utilitas
+# =========================================================
+def load_stock_list(filepath: str) -> pd.DataFrame:
+    return pd.read_excel(filepath)
 
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 3rem;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .sub-header {
-        font-size: 1.5rem;
-        color: #2ca02c;
-        margin-bottom: 1rem;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin-bottom: 1rem;
-        text-align: center;
-    }
-    .success-box {
-        background-color: #d4edda;
-        color: #155724;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 1rem 0;
-    }
-    .warning-box {
-        background-color: #fff3cd;
-        color: #856404;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 1rem 0;
-    }
-    .info-box {
-        background-color: #d1ecf1;
-        color: #0c5460;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 1rem 0;
-    }
-    .upload-section {
-        background-color: #e9ecef;
-        padding: 2rem;
-        border-radius: 0.5rem;
-        margin-bottom: 2rem;
-        text-align: center;
-    }
-</style>
-""", unsafe_allow_html=True)
+def fetch_stock_data(kode_saham: pd.DataFrame, period: str = "6y", progress_callback=None) -> pd.DataFrame:
+    kode_list = (kode_saham['Kode'] + ".JK").to_list()
+    total = len(kode_list)
+    data_combined = pd.DataFrame()
 
-def get_stock_data(stock_code):
-    try:
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=5*365)
-        
-        stock = yf.Ticker(stock_code)
-        hist = stock.history(start=start_date, end=end_date)
-        
-        if hist.empty:
-            st.warning(f"Tidak ditemukan data untuk {stock_code}")
-            return None
-        
-        # Mengambil hanya kolom Close
-        close_prices = hist['Close']
-        
-        # Handle missing values - drop NaN values
-        close_prices = close_prices.dropna()
-        
-        if close_prices.empty:
-            st.warning(f"Data untuk {stock_code} hanya berisi NaN values")
-            return None
-        
-        # Konversi harga ke integer (setelah handle NaN)
-        close_prices = close_prices.astype(int)
-        
-        # Format index menjadi hanya tanggal (tanpa waktu)
-        close_prices.index = close_prices.index.date
-        
-        # Hapus .JK dari nama series, hanya ambil kode perusahaan saja
-        company_code = stock_code.replace('.JK', '')
-        close_prices.name = company_code
-        
-        return close_prices
-    
-    except Exception as e:
-        st.error(f"Error mendapatkan data {stock_code}: {e}")
+    for i, kode in enumerate(kode_list, 1):
+        try:
+            ticker = yf.Ticker(kode)
+            data = ticker.history(period=period)['Close'].round()
+            data = data.to_frame(name=kode.replace(".JK", ""))
+            if data_combined.empty:
+                data_combined = data
+            else:
+                data_combined = data_combined.join(data, how='outer')
+        except Exception:
+            pass  # Lewati saham yang gagal diambil
+        if progress_callback:
+            progress_callback(i / total)
+
+    # Format tanggal agar lebih rapi (dd-mm-yyyy)
+    data_combined.index = data_combined.index.strftime("%d-%m-%Y")
+    return data_combined
+
+def filter_data_by_years(data: pd.DataFrame, years: int) -> pd.DataFrame:
+    # Konversi index kembali ke datetime untuk perhitungan
+    data.index = pd.to_datetime(data.index, format="%d-%m-%Y")
+    latest_date = data.index.max()
+    cutoff_date = latest_date - pd.DateOffset(years=years)
+    subset = data[data.index >= cutoff_date]
+    valid_cols = (
+        subset[subset.index.year == cutoff_date.year]
+        .dropna(axis=1, how="all")
+        .columns.to_list()
+    )
+    subset.index = subset.index.strftime("%d-%m-%Y")
+    return subset[valid_cols]
+
+def compute_statistics(data: pd.DataFrame, label: str) -> dict:
+    return {
+        f"Max {label}": data.max(),
+        f"Min {label}": data.min(),
+        f"Mean {label}": data.mean().round()
+    }
+
+def combine_with_current(data_stats: dict, harga_sekarang: pd.DataFrame) -> pd.DataFrame:
+    frames = [df.to_frame(name=col_name) for col_name, df in data_stats.items()]
+    combined = pd.concat(frames + [harga_sekarang], axis=1)
+    return combined
+
+def check_status(row, period_label: str):
+    now = row["Now"]
+    value_5 = row.get(f"{period_label} 5 Years")
+    value_3 = row.get(f"{period_label} 3 Years")
+    value_1 = row.get(f"{period_label} 1 Years")
+    if pd.notna(value_5) and now < value_5:
+        return f"Lower than 5 years {period_label.lower()}"
+    elif pd.notna(value_3) and now < value_3:
+        return f"Lower than 3 years {period_label.lower()}"
+    elif pd.notna(value_1) and now < value_1:
+        return f"Lower than 1 year {period_label.lower()}"
+    else:
         return None
 
-def get_multiple_stocks(stock_list):
-    all_data = {}
+
+# =========================================================
+# 2. Fungsi utama analisis
+# =========================================================
+def analyze_data(data: pd.DataFrame):
+    data_ff = data.ffill()
+    latest_date = pd.to_datetime(data_ff.index, format="%d-%m-%Y").max()
+    harga_sekarang = data_ff.loc[data_ff.index == latest_date.strftime("%d-%m-%Y")].T
+    harga_sekarang.columns = ["Now"]
+
+    data_1y = filter_data_by_years(data_ff.copy(), 1)
+    data_3y = filter_data_by_years(data_ff.copy(), 3)
+    data_5y = filter_data_by_years(data_ff.copy(), 5)
+
+    stats_1y = compute_statistics(data_1y, "1 Years")
+    stats_3y = compute_statistics(data_3y, "3 Years")
+    stats_5y = compute_statistics(data_5y, "5 Years")
+
+    result = {}
+    for label in ["Max", "Min", "Mean"]:
+        combined = combine_with_current(
+            {
+                f"{label} 1 Years": stats_1y[f"{label} 1 Years"],
+                f"{label} 3 Years": stats_3y[f"{label} 3 Years"],
+                f"{label} 5 Years": stats_5y[f"{label} 5 Years"],
+            },
+            harga_sekarang,
+        )
+        combined["Status"] = combined.apply(check_status, axis=1, period_label=label)
+        combined = combined.dropna(subset=["Status"])
+        result[label] = combined
+
+    return result
+
+
+# =========================================================
+# 3. Streamlit Dashboard
+# =========================================================
+st.set_page_config(page_title="📊 Stock Analyzer Dashboard", layout="wide")
+st.title("📈 Stock Analyzer Dashboard")
+
+stock_file = "database/Daftar Saham.xlsx"
+
+if "data_saham" not in st.session_state:
+    st.session_state.data_saham = None
+if "analysis" not in st.session_state:
+    st.session_state.analysis = None
+
+# Tombol ambil data
+st.subheader("1️⃣ Ambil Data Saham dari Yahoo Finance")
+get_data_btn = st.button("📥 Get Stock Price")
+
+if get_data_btn and stock_file is not None:
+    kode_df = load_stock_list(stock_file)
     progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for i, stock_code in enumerate(stock_list):
-        status_text.text(f"Mengambil data {stock_code}... ({i+1}/{len(stock_list)})")
-        full_stock_code = stock_code + ".JK"
-        data = get_stock_data(full_stock_code)
-        
-        if data is not None:
-            all_data[stock_code] = data
-        else:
-            st.warning(f"Data {stock_code} tidak valid atau kosong")
-        
-        progress_bar.progress((i + 1) / len(stock_list))
-        time.sleep(0.1)  # Small delay to show progress
-    
-    progress_bar.empty()
-    status_text.empty()
-    
-    if all_data:
-        # Gabungkan semua data menjadi DataFrame
-        df = pd.concat(all_data.values(), axis=1, keys=all_data.keys())
-        df.index.name = 'Date'
-        
-        # Handle missing values dalam DataFrame gabungan
-        df = df.dropna()  # Hapus baris yang memiliki NaN di salah satu kolom
-        
-        # Konversi ke integer hanya jika tidak ada NaN
-        df = df.astype(int)
-        
-        return df
-    else:
-        st.error("Tidak ada data yang berhasil diambil")
-        return None
+    with st.spinner("Mengambil data harga saham dari Yahoo Finance..."):
+        data_saham = fetch_stock_data(kode_df, progress_callback=progress_bar.progress)
+        st.session_state.data_saham = data_saham
+    progress_bar.progress(1.0)
+    st.success("✅ Data saham berhasil diambil!")
 
-def get_data_period_info(stock_series):
-    """
-    Mendapatkan informasi periode data yang tersedia untuk suatu saham
-    """
-    if stock_series.empty:
-        return "Tidak ada data", 0
-    
-    start_date = stock_series.index.min()
-    end_date = stock_series.index.max()
-    days_available = len(stock_series)
-    
-    # Hitung durasi dalam tahun
-    duration_days = (end_date - start_date).days
-    duration_years = duration_days / 365.25
-    
-    if duration_years >= 4.5:
-        return "5 tahun", 5
-    elif duration_years >= 2.5:
-        return "3 tahun", 3
-    elif duration_years >= 0.5:
-        return "1 tahun", 1
-    else:
-        return f"{int(duration_days/30)} bulan", 0
+# Menampilkan tabel
+st.subheader("2️⃣ Data Saham yang Diambil")
+if st.session_state.data_saham is not None:
+    st.dataframe(st.session_state.data_saham.tail(10))
+else:
+    st.info("Belum ada data saham yang diambil. Tekan tombol Get Stock Price untuk mulai.")
 
-def get_status_dataframe(stock_df):
-    """
-    Membuat dataframe dengan status harga saham terendah
-    dengan menyesuaikan periode berdasarkan ketersediaan data
-    """
-    status_data = []
-    
-    for column in stock_df.columns:
-        try:
-            current_price = stock_df[column].iloc[-1]  # Harga terakhir
-            all_time_data = stock_df[column]  # Semua data yang tersedia
-            
-            # Dapatkan info periode data
-            period_info, available_years = get_data_period_info(all_time_data)
-            
-            # Hitung tanggal untuk periode berdasarkan data yang tersedia
-            end_date = datetime.now().date()
-            
-            # Sesuaikan periode dengan data yang tersedia
-            if available_years >= 5:
-                # Data 5 tahun tersedia
-                five_years_ago = (datetime.now() - timedelta(days=5*365)).date()
-                period_data = all_time_data[all_time_data.index >= five_years_ago]
-                status_type = "5 tahun terakhir"
-                
-            elif available_years >= 3:
-                # Data 3 tahun tersedia
-                three_years_ago = (datetime.now() - timedelta(days=3*365)).date()
-                period_data = all_time_data[all_time_data.index >= three_years_ago]
-                status_type = "3 tahun terakhir"
-                
-            elif available_years >= 1:
-                # Data 1 tahun tersedia
-                one_year_ago = (datetime.now() - timedelta(days=365)).date()
-                period_data = all_time_data[all_time_data.index >= one_year_ago]
-                status_type = "1 tahun terakhir"
-                
-            else:
-                # Data kurang dari 1 tahun, gunakan semua data yang ada
-                period_data = all_time_data
-                status_type = f"seluruh periode ({period_info})"
-            
-            # Pastikan data tidak kosong
-            if period_data.empty:
-                continue
-            
-            # Cek apakah harga terkini adalah terendah dalam periode
-            if current_price == period_data.min():
-                status_data.append({
-                    'Kode Perusahaan': column,
-                    'Harga Terkini': current_price,
-                    'Status': f"terendah {status_type}",
-                    'Periode Data': period_info,
-                    'Harga Terendah Periode': period_data.min(),
-                    'Jumlah Data': len(all_time_data)
-                })
-                
-        except Exception as e:
-            st.warning(f"Error memproses {column}: {e}")
-            continue
-    
-    # Buat dataframe dari data status
-    if status_data:
-        status_df = pd.DataFrame(status_data)
-        status_df = status_df.set_index('Kode Perusahaan')
-        return status_df
-    else:
-        st.info("Tidak ada saham yang memenuhi kriteria status")
-        return None
+# =========================================================
+# Grafik Per Saham
+# =========================================================
+if st.session_state.data_saham is not None:
+    st.subheader("📊 Grafik Harga Saham")
+    saham_terpilih = st.selectbox("Pilih saham untuk ditampilkan:", st.session_state.data_saham.columns)
+    df_chart = st.session_state.data_saham[[saham_terpilih]].dropna()
+    df_chart.index = pd.to_datetime(df_chart.index, format="%d-%m-%Y")
+    st.line_chart(df_chart, height=400)
+else:
+    st.subheader("📊 Grafik Harga Saham")
+    st.info("Grafik akan muncul setelah data berhasil diambil.")
 
-def plot_stock_prices(stock_df, selected_stocks):
-    fig, ax = plt.subplots(figsize=(12, 6))
-    
-    for stock in selected_stocks:
-        if stock in stock_df.columns:
-            ax.plot(stock_df.index, stock_df[stock], label=stock, linewidth=2)
-    
-    ax.set_title('Perubahan Harga Saham')
-    ax.set_xlabel('Tanggal')
-    ax.set_ylabel('Harga (IDR)')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    # Format tanggal pada x-axis
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    
-    return fig
+# =========================================================
+# Analisis dan Status
+# =========================================================
+if st.session_state.data_saham is not None:
+    st.subheader("3️⃣ Analisis Status Saham")
+    option = st.radio("Pilih tipe analisis:", ["Max", "Min", "Mean"], horizontal=True)
 
-def main():
-    # Header
-    st.markdown('<h1 class="main-header">📈 Stock Analysis Dashboard</h1>', unsafe_allow_html=True)
-    
-    # Upload section
-    st.markdown('<div class="upload-section">', unsafe_allow_html=True)
-    st.markdown('### 📤 Upload File Daftar Saham')
-    uploaded_file = st.file_uploader("Upload File Excel dengan kolom 'Kode' yang berisi daftar saham", 
-                                    type=['xlsx'], 
-                                    label_visibility="collapsed")
-    st.markdown('</div>', unsafe_allow_html=True)
-    
-    if uploaded_file is not None:
-        try:
-            daftar_emitem = pd.read_excel(uploaded_file)
-            if 'Kode' in daftar_emitem.columns:
-                stock_list = daftar_emitem['Kode'].tolist()
-                
-                # Informasi file yang diupload
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-                    st.metric("Jumlah Saham", len(stock_list))
-                    st.markdown('</div>', unsafe_allow_html=True)
-                
-                with col2:
-                    st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-                    st.metric("Nama File", uploaded_file.name)
-                    st.markdown('</div>', unsafe_allow_html=True)
-                
-                with col3:
-                    st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-                    st.metric("Ukuran File", f"{uploaded_file.size / 1024:.1f} KB")
-                    st.markdown('</div>', unsafe_allow_html=True)
-                
-                # Tampilkan preview data
-                st.markdown("### 📋 Preview Daftar Saham")
-                st.dataframe(daftar_emitem.head(), use_container_width=True)
-                
-                # Informasi periode analisis
-                st.markdown("### 📅 Informasi Periode Analisis")
-                info_col1, info_col2, info_col3, info_col4 = st.columns(4)
-                with info_col1:
-                    st.info(f"**Data Terakhir:**\n{datetime.now().date().strftime('%Y-%m-%d')}")
-                with info_col2:
-                    st.info(f"**Target 5 Tahun:**\n{(datetime.now() - timedelta(days=5*365)).date().strftime('%Y-%m-%d')}")
-                with info_col3:
-                    st.info(f"**Target 3 Tahun:**\n{(datetime.now() - timedelta(days=3*365)).date().strftime('%Y-%m-%d')}")
-                with info_col4:
-                    st.info(f"**Target 1 Tahun:**\n{(datetime.now() - timedelta(days=365)).date().strftime('%Y-%m-%d')}")
-                
-                # Load data button
-                if st.button("🚀 Muat Data Saham", type="primary", use_container_width=True):
-                    with st.spinner("Sedang memuat data saham..."):
-                        saham_df = get_multiple_stocks(stock_list)
-                        
-                        if saham_df is not None:
-                            st.session_state.saham_df = saham_df
-                            st.session_state.stock_list = stock_list
-                            st.success(f"✅ Berhasil memuat data {len(saham_df.columns)} saham")
-                
-                # Display data if available
-                if 'saham_df' in st.session_state:
-                    saham_df = st.session_state.saham_df
-                    
-                    st.divider()
-                    st.markdown("### 📊 Metrics Data Saham")
-                    
-                    # Metrics
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("Jumlah Saham", len(saham_df.columns))
-                    with col2:
-                        st.metric("Periode Data", f"{len(saham_df)} hari")
-                    with col3:
-                        latest_date = saham_df.index[-1]
-                        st.metric("Data Terakhir", str(latest_date))
-                    with col4:
-                        oldest_date = saham_df.index[0]
-                        st.metric("Data Terlama", str(oldest_date))
-                    
-                    # Info periode masing-masing saham
-                    st.markdown("### 📅 Info Periode Data per Saham")
-                    period_info_data = []
-                    for column in saham_df.columns:
-                        period_info, available_years = get_data_period_info(saham_df[column])
-                        period_info_data.append({
-                            'Kode': column,
-                            'Periode': period_info,
-                            'Data Points': len(saham_df[column]),
-                            'Tahun': available_years
-                        })
-                    
-                    period_df = pd.DataFrame(period_info_data)
-                    st.dataframe(period_df.set_index('Kode'), use_container_width=True)
-                    
-                    st.divider()
-                    
-                    # Stock selection for chart
-                    st.markdown("### 📈 Grafik Harga Saham")
-                    selected_stocks = st.multiselect(
-                        "Pilih saham untuk ditampilkan pada grafik:",
-                        options=saham_df.columns.tolist(),
-                        default=saham_df.columns.tolist()[:3]  # Default first 3 stocks
-                    )
-                    
-                    if selected_stocks:
-                        fig = plot_stock_prices(saham_df, selected_stocks)
-                        st.pyplot(fig)
-                    
-                    st.divider()
-                    
-                    # Status analysis
-                    st.markdown("### 🔍 Analisis Status Harga")
-                    
-                    if st.button("🔄 Analisis Status Harga", use_container_width=True):
-                        with st.spinner("Sedang menganalisis status harga..."):
-                            status_df = get_status_dataframe(saham_df)
-                            
-                            if status_df is not None:
-                                st.session_state.status_df = status_df
-                    
-                    if 'status_df' in st.session_state:
-                        status_df = st.session_state.status_df
-                        
-                        # Display status table
-                        st.dataframe(
-                            status_df.style.format({
-                                'Harga Terkini': '{:,}',
-                                'Harga Terendah Periode': '{:,}',
-                                'Jumlah Data': '{:,}'
-                            }).highlight_max(color='lightgreen').highlight_min(color='lightcoral'),
-                            use_container_width=True
-                        )
-                        
-                        # Summary metrics
-                        st.markdown("### 📋 Ringkasan Status")
-                        status_counts = status_df['Status'].value_counts()
-                        
-                        for status_type, count in status_counts.items():
-                            st.markdown(f'<div class="success-box">'
-                                      f'🏆 {count} saham dengan status: <b>{status_type}</b>'
-                                      f'</div>', unsafe_allow_html=True)
-                    
-                    st.divider()
-                    
-                    # Raw data
-                    st.markdown("### 📄 Data Mentah")
-                    if st.checkbox("Tampilkan data mentah"):
-                        st.dataframe(saham_df.tail(20), use_container_width=True)
-                        
-                        # Download button
-                        csv = saham_df.to_csv().encode('utf-8')
-                        st.download_button(
-                            label="📥 Download Data CSV",
-                            data=csv,
-                            file_name="stock_data.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                        
-            else:
-                st.error("❌ File harus memiliki kolom 'Kode' yang berisi daftar kode saham")
-                
-        except Exception as e:
-            st.error(f"❌ Error membaca file: {e}")
-    
-    else:
-        st.markdown("""
-        <div class="info-box">
-        <h3>📝 Instruksi:</h3>
-        <ol>
-            <li>Upload file Excel yang memiliki kolom 'Kode' berisi daftar saham</li>
-            <li>Contoh format: AALI, BBCA, BBRI, TLKM, UNVR</li>
-            <li>File akan diproses dan data saham akan diambil otomatis</li>
-            <li>Analisis status harga akan ditampilkan setelah data dimuat</li>
-        </ol>
-        </div>
-        """, unsafe_allow_html=True)
+    if st.session_state.analysis is None:
+        with st.spinner("Menganalisis data saham..."):
+            st.session_state.analysis = analyze_data(st.session_state.data_saham)
 
-if __name__ == "__main__":
-    main()
+    df_status = st.session_state.analysis[option]
+    st.dataframe(df_status)
+
+    # Generate file Excel
+    st.subheader("4️⃣ Generate File Excel")
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        for label, df in st.session_state.analysis.items():
+            df.to_excel(writer, sheet_name=label)
+    buffer.seek(0)
+
+    st.download_button(
+        label="💾 Download Excel File",
+        data=buffer,
+        file_name="Stock_Status.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+else:
+    st.subheader("3️⃣ Analisis Status Saham")
+    st.radio("Pilih tipe analisis:", ["Max", "Min", "Mean"], horizontal=True)
+    st.info("Analisis belum dapat dilakukan sebelum data diambil.")
+    st.subheader("4️⃣ Generate File Excel")
+    st.warning("Silakan ambil data saham terlebih dahulu sebelum membuat file Excel.")
