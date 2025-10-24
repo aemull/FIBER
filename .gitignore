@@ -1,6 +1,6 @@
 .venv-linux
-database/*
-output
+database/Daftar Saham copy.xlsx
+output/*
 .gitignire
 __pycache__
 percobaan

@@ -76,7 +76,7 @@ def download_xbrl_idx(kode_perusahaan, tahun, kuartal, directory_download):
         return False, f"❌ Error downloading {kode_perusahaan}: {str(e)}"
 
 
-daftar_saham = pd.read_excel("database\Daftar Saham.xlsx")
+daftar_saham = pd.read_excel("database/Daftar Saham.xlsx")
 
 ##################################
 ##             VIEW             ##
