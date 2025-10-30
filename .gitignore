@@ -1,6 +1,7 @@
 .venv-linux
 database/Daftar Saham copy.xlsx
 output/*
-.gitignire
+.gitignore
 __pycache__
 percobaan
+.venv

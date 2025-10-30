@@ -8,4 +8,4 @@ st.set_page_config(
 )
 
 st.title("🏠 HOME")
-st.text_area(value= "ini hanya untuk demo, untuk kecepatan danfuntional beberapa dipangkas 😊")
+st.text("INI ADALAH UNTUK DEMO SAJA, beberapa Fitur dibatasi agar tidak membebani server")
